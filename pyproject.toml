@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jt9d_steady_state_solver"
+version = "1.0.0"
+description = "0D Steady-State Aerothermodynamic Performance Solver for Pratt & Whitney JT9D-7A (MoC 2 Compliance)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Aerospace",
+]
+dependencies = [
+    "numpy>=1.22.0",
+    "scipy>=1.8.0",
+    "matplotlib>=3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*", "tests*"]
