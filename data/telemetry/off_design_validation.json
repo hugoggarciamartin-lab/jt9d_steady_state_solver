@@ -1,0 +1,16 @@
+{
+    "validation_points": [
+        {
+            "rating": "Climb/Out (85%)",
+            "W_f_target_kg_s": 1.7890
+        },
+        {
+            "rating": "Approach (30%)",
+            "W_f_target_kg_s": 0.6190
+        },
+        {
+            "rating": "Idle (7%)",
+            "W_f_target_kg_s": 0.2110
+        }
+    ]
+}
