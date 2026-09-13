@@ -3,7 +3,8 @@
     "geometry": {
         "A8_m2": 0.4418,
         "A18_m2": 1.3385,
-        "V_liner_m3": 0.0352
+        "V_liner_m3": 0.0352,
+        "BPR_design": 5.0
     },
     "bleeds": {
         "customer_bleed_fraction": 0.0200,
@@ -14,11 +15,19 @@
         "eta_PGB": 1.0,
         "power_accessory_base_W": 60000.0,
         "k_parasitic_W": 25000.0,
-        "N_HP_design_rpm": 8000.0
+        "N_HP_design_rpm": 8000.0,
+        "design_speeds": {
+            "N1_rpm": 3500.0,
+            "N2_rpm": 8000.0
+        }
     },
     "flammability_limits": {
         "f_LDO": 0.0080,
-        "f_RBO": 0.0580
+        "f_RBO": 0.0580,
+        "combustor_calibration_defaults": {
+            "k1": 0.00020,
+            "k2": 0.00008
+        }
     },
     "certification_redlines": {
         "N1_max_rpm": 3750.0,

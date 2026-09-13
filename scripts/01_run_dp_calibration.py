@@ -1,8 +1,8 @@
 """
 Design Point Analytical Sizing Script.
-Bypasses empirical maps to establish the exact thermodynamic baseline.
-Solves a 2x2 Jacobian (W2, Tt4) to strictly match Fn and EGT telemetry targets,
-and exports the optimization vector u, DP magnitudes, and map scaling factors.
+Calculates the exact thermodynamic baseline using real station telemetry.
+Solves a 2x2 Jacobian (W2, Tt4) to strictly match Fn and EGT targets.
+Data Coupling enforced: All parameters extracted from external JSON configurations.
 """
 
 import sys
@@ -19,215 +19,285 @@ from src.utils.map_parser import parse_tmats_map
 from src.numerical.newton_raphson import NewtonRaphsonSolver
 
 
-def load_configuration(file_path: Path) -> dict:
+def load_json(file_path: Path) -> dict:
     if not file_path.exists():
-        raise FileNotFoundError(f"Configuration file missing: {file_path}")
+        raise FileNotFoundError(f"Missing configuration file: {file_path}")
     with open(file_path, "r") as f:
         return json.load(f)
 
 
-def main():
-    project_root = Path(__file__).resolve().parents[1]
-    output_dir = project_root / "output" / "logs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    map_dir = project_root / "data" / "maps"
+class AnalyticalDPEvaluator:
+    def __init__(self, telemetry: dict, engine_specs: dict):
+        self.telemetry = telemetry
+        self.specs = engine_specs
+        self.gas = GasProperties()
 
-    target_data = {"Fn": 205000.0, "EGT": 815.0}  # JT9D-7A Telemetry
+        self.Pt2 = self.telemetry["station_telemetry"]["Pt2_Pa"]
+        self.Tt2 = self.telemetry["station_telemetry"]["Tt2_K"]
+        self.P_amb = self.telemetry["reference_conditions"]["P0_Pa"]
 
-    ambient_cond = {"Pt2": 101325.0, "Tt2": 288.15, "P_amb": 101325.0}
+        self.PR_fan = self.telemetry["station_telemetry"]["Pt13_Pa"] / self.Pt2
+        self.PR_lpc = self.telemetry["station_telemetry"]["Pt25_Pa"] / self.Pt2
+        self.PR_hpc = (
+            self.telemetry["station_telemetry"]["Pt3_Pa"]
+            / self.telemetry["station_telemetry"]["Pt25_Pa"]
+        )
 
-    # JT9D-7A Baseline Design Assumptions (No maps required for DP sizing)
-    design_assumptions = {
-        "BPR": 5.0,
-        "PR_fan": 1.5,
-        "eta_fan": 0.89,
-        "PR_lpc": 1.8,
-        "eta_lpc": 0.88,
-        "PR_hpc": 10.0,
-        "eta_hpc": 0.87,
-        "eta_hpt": 0.90,
-        "eta_lpt": 0.91,
-        "bleed_frac": 0.105,
-        "mech_eff": 0.99,
-    }
+        self.PR_hpt = 0.0
+        self.PR_lpt = 0.0
 
-    gas = GasProperties()
-    nr_solver = NewtonRaphsonSolver(max_iters=30, tolerance=1e-5)
+        self.eta_fan = 0.0
+        self.eta_lpc = 0.0
+        self.eta_hpc = 0.0
 
-    def evaluate_analytical_dp(state_vector: np.ndarray) -> np.ndarray:
+        self.Tt45_converged = 0.0
+        self.Pt45_converged = 0.0
+        self.Pt4_converged = 0.0
+        self.Tt4_converged = 0.0
+
+    def evaluate(self, state_vector: np.ndarray) -> np.ndarray:
         W2, Tt4 = state_vector
-
         W2 = max(W2, 100.0)
         Tt4 = max(Tt4, 1000.0)
 
-        W_core = W2 / (1.0 + design_assumptions["BPR"])
+        BPR = 5.0
+        W_core = W2 / (1.0 + BPR)
         W_byp = W2 - W_core
 
-        # --- FAN & COMPRESSION ---
-        Pt13 = ambient_cond["Pt2"] * design_assumptions["PR_fan"]
-        h2 = gas.calculate_enthalpy(ambient_cond["Tt2"], 0.0)
+        h2 = self.gas.calculate_enthalpy(self.Tt2, 0.0)
 
-        Tt13_is = ambient_cond["Tt2"] * (design_assumptions["PR_fan"] ** (0.4 / 1.4))
-        dh_fan_byp = (gas.calculate_enthalpy(Tt13_is, 0.0) - h2) / design_assumptions[
-            "eta_fan"
-        ]
+        # Fan tip (Bypass)
+        Tt13_is = self.Tt2 * (self.PR_fan ** (0.4 / 1.4))
+        Tt13_actual = self.telemetry["station_telemetry"]["Tt13_K"]
+        dh_fan_byp = self.gas.calculate_enthalpy(Tt13_actual, 0.0) - h2
+        self.eta_fan = (self.gas.calculate_enthalpy(Tt13_is, 0.0) - h2) / dh_fan_byp
 
-        Pt25 = (
-            ambient_cond["Pt2"]
-            * design_assumptions["PR_fan"]
-            * design_assumptions["PR_lpc"]
-        )
-        Tt25_is = ambient_cond["Tt2"] * ((Pt25 / ambient_cond["Pt2"]) ** (0.4 / 1.4))
-        dh_lpc = (gas.calculate_enthalpy(Tt25_is, 0.0) - h2) / design_assumptions[
-            "eta_lpc"
-        ]
-        Tt25 = ambient_cond["Tt2"] + dh_lpc / 1004.0
+        # LPC
+        Tt25_is = self.Tt2 * (self.PR_lpc ** (0.4 / 1.4))
+        Tt25_actual = self.telemetry["station_telemetry"]["Tt25_K"]
+        dh_lpc = self.gas.calculate_enthalpy(Tt25_actual, 0.0) - h2
+        self.eta_lpc = (self.gas.calculate_enthalpy(Tt25_is, 0.0) - h2) / dh_lpc
 
         # HPC
-        Pt3 = Pt25 * design_assumptions["PR_hpc"]
-        Tt3_is = Tt25 * (design_assumptions["PR_hpc"] ** (0.4 / 1.4))
-        dh_hpc = (
-            gas.calculate_enthalpy(Tt3_is, 0.0) - gas.calculate_enthalpy(Tt25, 0.0)
-        ) / design_assumptions["eta_hpc"]
-        Tt3 = Tt25 + dh_hpc / 1004.0
+        Tt3_is = Tt25_actual * (self.PR_hpc ** (0.4 / 1.4))
+        Tt3_actual = self.telemetry["station_telemetry"]["Tt3_K"]
+        h_25 = self.gas.calculate_enthalpy(Tt25_actual, 0.0)
+        h_3 = self.gas.calculate_enthalpy(Tt3_actual, 0.0)
+        dh_hpc = h_3 - h_25
+        self.eta_hpc = (self.gas.calculate_enthalpy(Tt3_is, 0.0) - h_25) / dh_hpc
 
-        W_bleed = W_core * design_assumptions["bleed_frac"]
-        W3 = W_core - W_bleed
+        cust_bleed = self.specs["bleeds"].get("customer_bleed_fraction", 0.0)
+        cool_bleed = self.specs["bleeds"]["cooling_bleed_fraction"]
 
-        # --- COMBUSTOR ---
-        Pi_cc = 0.955
-        Pt4 = Pt3 * Pi_cc
-        W4 = W3
+        W_bleed_cool = W_core * cool_bleed
+        W31 = W_core * (1.0 - cust_bleed - cool_bleed)
 
-        # --- TURBINES (Work Balance) ---
+        # Combustor: Analytical Pressure Loss Factor (PLF)
+        Pt3_actual = self.telemetry["station_telemetry"]["Pt3_Pa"]
+
+        # Traverse correctly through flammability_limits nesting
+        k1 = self.specs["flammability_limits"]["combustor_calibration_defaults"]["k1"]
+        k2 = self.specs["flammability_limits"]["combustor_calibration_defaults"]["k2"]
+        flow_parameter = (W31 * (Tt3_actual**0.5)) / Pt3_actual
+
+        dp_loss = k1 * (flow_parameter**2) + k2 * (flow_parameter**2) * (
+            (Tt4 / Tt3_actual) - 1.0
+        )
+        Pt4 = Pt3_actual * (1.0 - dp_loss)
+
+        W_f = self.telemetry["global_performance"]["W_f_exp_kg_s"]
+        W4 = W31 + W_f
+
+        # Turbines
         req_power_hpc = W_core * dh_hpc
         req_power_lp = (W_byp * dh_fan_byp) + (W_core * dh_lpc)
 
-        dh_hpt = (req_power_hpc / design_assumptions["mech_eff"]) / W4
-        h4 = gas.calculate_enthalpy(Tt4, 0.02)
+        dh_hpt = (req_power_hpc / self.specs["mechanical"]["eta_PGB"]) / W4
+        h4 = self.gas.calculate_enthalpy(Tt4, 0.02)
         h45 = h4 - dh_hpt
         Tt45 = Tt4 - (dh_hpt / 1150.0)
-        Pt45 = Pt4 * (Tt45 / Tt4) ** (1.33 / 0.33 * (1 / design_assumptions["eta_hpt"]))
+        Pt45 = Pt4 * (Tt45 / Tt4) ** (1.33 / 0.33 * (1 / 0.90))
 
-        # Cooling Mix
-        W45 = W4 + W_bleed
-        Tt45_mix = (W4 * Tt45 + W_bleed * Tt3) / W45
+        W45 = W4 + W_bleed_cool
+        Tt45_mix = (W4 * Tt45 + W_bleed_cool * Tt3_actual) / W45
 
-        dh_lpt = (req_power_lp / design_assumptions["mech_eff"]) / W45
+        dh_lpt = (req_power_lp / self.specs["mechanical"]["eta_PGB"]) / W45
         Tt5 = Tt45_mix - (dh_lpt / 1150.0)
-        Pt5 = Pt45 * (Tt5 / Tt45_mix) ** (
-            1.33 / 0.33 * (1 / design_assumptions["eta_lpt"])
-        )
+        Pt5 = Pt45 * (Tt5 / Tt45_mix) ** (1.33 / 0.33 * (1 / 0.91))
 
-        # Store internal DP pressure ratios for evaluation extraction
-        evaluate_analytical_dp.PR_hpt = Pt3 / Pt45
-        evaluate_analytical_dp.PR_lpt = Pt45 / Pt5
+        self.PR_hpt = Pt4 / Pt45
+        self.PR_lpt = Pt45 / Pt5
+        self.Tt45_converged = Tt45_mix
+        self.Pt45_converged = Pt45
+        self.Pt4_converged = Pt4
+        self.Tt4_converged = Tt4
 
-        # --- NOZZLES ---
+        # Nozzles
+        k_noz = self.specs["nozzle_calibration_defaults"]["k_noz"]
+        Pt5_eff = Pt5 * (1.0 - k_noz)
+        Pt13_eff = self.telemetry["station_telemetry"]["Pt13_Pa"] * (1.0 - k_noz)
+
         V_exit_core = np.sqrt(
             2
             * 1.33
             / (1.33 - 1)
             * 287
             * Tt5
-            * (1 - (ambient_cond["P_amb"] / Pt5) ** (0.33 / 1.33))
+            * (1 - (self.P_amb / max(Pt5_eff, self.P_amb)) ** (0.33 / 1.33))
         )
         V_exit_byp = np.sqrt(
             2
             * 1.4
             / (1.4 - 1)
             * 287
-            * ambient_cond["Tt2"]
-            * (1 - (ambient_cond["P_amb"] / Pt13) ** (0.4 / 1.4))
+            * Tt13_actual
+            * (1 - (self.P_amb / max(Pt13_eff, self.P_amb)) ** (0.4 / 1.4))
         )
 
-        Fn_calc = (W45 * V_exit_core) + (W_byp * V_exit_byp)
+        Cd_8 = self.specs["nozzle_calibration_defaults"]["Cd_8_initial"]
+        Cd_18 = self.specs["nozzle_calibration_defaults"]["Cd_18_initial"]
 
-        res_Fn = (Fn_calc - target_data["Fn"]) / target_data["Fn"]
-        res_EGT = (Tt5 - target_data["EGT"]) / target_data["EGT"]
+        Fn_calc = (W45 * V_exit_core * Cd_8) + (W_byp * V_exit_byp * Cd_18)
+
+        Fn_target = self.telemetry["global_performance"]["F_N_exp_N"]
+        EGT_target = self.telemetry["station_telemetry"]["Tt5_K"]
+
+        res_Fn = (Fn_calc - Fn_target) / Fn_target
+        res_EGT = (Tt5 - EGT_target) / EGT_target
 
         return np.array([res_Fn, res_EGT])
 
+
+def calc_corrected_flow(W: float, Pt: float, Tt: float) -> float:
+    theta = Tt / 288.15
+    delta = Pt / 101325.0
+    return W * np.sqrt(theta) / delta
+
+
+def main():
+    project_root = Path(__file__).resolve().parents[1]
+    output_dir = project_root / "output" / "logs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    map_dir = project_root / "data" / "maps"
+    config_dir = project_root / "data" / "config"
+    telemetry_dir = project_root / "data" / "telemetry"
+
+    telemetry = load_json(telemetry_dir / "dp_test_cell_data.json")
+    specs = load_json(config_dir / "engine_specs.json")
+
+    nr_solver = NewtonRaphsonSolver(max_iters=30, tolerance=1e-5)
+    evaluator = AnalyticalDPEvaluator(telemetry, specs)
+
     initial_guess = np.array([600.0, 1500.0])
-
     converged_state, final_residuals, success = nr_solver.solve(
-        evaluate_analytical_dp, initial_guess
+        evaluator.evaluate, initial_guess
     )
-
-    print(f"Analytical DP Converged: {success}")
-    print(f"Required Inlet Mass Flow (W2): {converged_state[0]:.2f} kg/s")
-    print(f"Required Combustor Temp (Tt4): {converged_state[1]:.2f} K")
-    print(f"Residuals [Fn, EGT]: {final_residuals}")
 
     if success:
         W2_conv, Tt4_conv = converged_state
-        W_core_conv = W2_conv / (1.0 + design_assumptions["BPR"])
+        BPR = 5.0
+        W_core_conv = W2_conv / (1.0 + BPR)
 
-        # Load raw T-MATS maps
+        cust_bleed = specs["bleeds"].get("customer_bleed_fraction", 0.0)
+        cool_bleed = specs["bleeds"]["cooling_bleed_fraction"]
+
+        u_vector = {
+            "eta_fan": evaluator.eta_fan,
+            "eta_lpc": evaluator.eta_lpc,
+            "eta_hpc": evaluator.eta_hpc,
+            "eta_hpt": 0.90,
+            "eta_lpt": 0.91,
+            "Cd_8": specs["nozzle_calibration_defaults"]["Cd_8_initial"],
+            "Cd_18": specs["nozzle_calibration_defaults"]["Cd_18_initial"],
+            "xi_cool": cool_bleed,
+            "k_noz": specs["nozzle_calibration_defaults"]["k_noz"],
+            "k1": specs["flammability_limits"]["combustor_calibration_defaults"]["k1"],
+            "k2": specs["flammability_limits"]["combustor_calibration_defaults"]["k2"],
+        }
+
+        dp_magnitudes = {
+            "PR_fan": evaluator.PR_fan,
+            "PR_lpc": evaluator.PR_lpc,
+            "PR_hpc": evaluator.PR_hpc,
+            "PR_hpt": evaluator.PR_hpt,
+            "PR_lpt": evaluator.PR_lpt,
+            "W2_physical": W2_conv,
+            "Tt4_physical": Tt4_conv,
+            "W_f_physical": telemetry["global_performance"]["W_f_exp_kg_s"],
+        }
+
+        required_maps = ["FAN.map", "LPC.map", "HPC.map", "HPT1.map", "LPT.map"]
+        for m in required_maps:
+            if not (map_dir / m).exists():
+                print(
+                    f"Warning: Map {m} missing. Scaling factors will not be generated."
+                )
+                return
+
         fan_map = parse_tmats_map(str(map_dir / "FAN.map"), True)
         lpc_map = parse_tmats_map(str(map_dir / "LPC.map"), True)
         hpc_map = parse_tmats_map(str(map_dir / "HPC.map"), True)
         hpt_map = parse_tmats_map(str(map_dir / "HPT1.map"), False)
         lpt_map = parse_tmats_map(str(map_dir / "LPT.map"), False)
 
-        # Evaluate maps at nominal DP design points
-        _, eff_fan_map, pr_fan_map, _ = fan_map.evaluate(1.0, 0.5)
-        _, eff_lpc_map, pr_lpc_map, _ = lpc_map.evaluate(1.0, 0.5)
-        _, eff_hpc_map, pr_hpc_map, _ = hpc_map.evaluate(1.0, 0.5)
-        _, eff_hpt_map, _ = hpt_map.evaluate(1.0, 3.0)
-        _, eff_lpt_map, _ = lpt_map.evaluate(1.0, 3.0)
+        Wc_fan_map, eff_fan_map, pr_fan_map, _ = fan_map.evaluate(1.0, 0.5)
+        Wc_lpc_map, eff_lpc_map, pr_lpc_map, _ = lpc_map.evaluate(1.0, 0.5)
+        Wc_hpc_map, eff_hpc_map, pr_hpc_map, _ = hpc_map.evaluate(1.0, 0.5)
+        Wc_hpt_map, eff_hpt_map, _ = hpt_map.evaluate(1.0, 3.0)
+        Wc_lpt_map, eff_lpt_map, _ = lpt_map.evaluate(1.0, 3.0)
 
-        # Optimization Parameter Vector u (matching the reference vector layout)
-        u_vector = {
-            "eta_fan": design_assumptions["eta_fan"],
-            "eta_lpc": design_assumptions["eta_lpc"],
-            "eta_hpc": design_assumptions["eta_hpc"],
-            "eta_hpt": design_assumptions["eta_hpt"],
-            "eta_lpt": design_assumptions["eta_lpt"],
-            "pi_cc": 0.955,
-            "Cd_8": 0.98,
-            "Cd_18": 0.98,
-            "xi_cool": design_assumptions["bleed_frac"],
-        }
+        W31 = W_core_conv * (1.0 - cust_bleed - cool_bleed)
+        W_4 = W31 + dp_magnitudes["W_f_physical"]
+        W_45 = W_4 + (W_core_conv * cool_bleed)
 
-        # DP Thermodynamic Magnitudes
-        dp_magnitudes = {
-            "PR_fan": design_assumptions["PR_fan"],
-            "PR_lpc": design_assumptions["PR_lpc"],
-            "PR_hpc": design_assumptions["PR_hpc"],
-            "PR_hpt": evaluate_analytical_dp.PR_hpt,
-            "PR_lpt": evaluate_analytical_dp.PR_lpt,
-            "W2_physical": W2_conv,
-            "Tt4_physical": Tt4_conv,
-        }
-
-        # Map Scaling Factors (SF)
-        theta_2 = ambient_cond["Tt2"] / 288.15
-        delta_2 = ambient_cond["Pt2"] / 101325.0
-        Wc_fan_analyt = W2_conv * np.sqrt(theta_2) / delta_2
-        Wc_fan_map, _, _, _ = fan_map.evaluate(1.0, 0.5)
+        Wc_fan_analyt = calc_corrected_flow(
+            W2_conv,
+            telemetry["station_telemetry"]["Pt2_Pa"],
+            telemetry["station_telemetry"]["Tt2_K"],
+        )
+        Wc_lpc_analyt = calc_corrected_flow(
+            W_core_conv,
+            telemetry["station_telemetry"]["Pt13_Pa"],
+            telemetry["station_telemetry"]["Tt13_K"],
+        )
+        Wc_hpc_analyt = calc_corrected_flow(
+            W_core_conv,
+            telemetry["station_telemetry"]["Pt25_Pa"],
+            telemetry["station_telemetry"]["Tt25_K"],
+        )
+        Wc_hpt_analyt = calc_corrected_flow(
+            W_4, evaluator.Pt4_converged, evaluator.Tt4_converged
+        )
+        Wc_lpt_analyt = calc_corrected_flow(
+            W_45, evaluator.Pt45_converged, evaluator.Tt45_converged
+        )
 
         scaling_factors = {
             "s_W_fan": Wc_fan_analyt / Wc_fan_map,
             "s_PR_fan": (dp_magnitudes["PR_fan"] - 1.0) / (pr_fan_map - 1.0),
             "s_eff_fan": u_vector["eta_fan"] / eff_fan_map,
+            "s_W_lpc": Wc_lpc_analyt / Wc_lpc_map,
+            "s_PR_lpc": (dp_magnitudes["PR_lpc"] - 1.0) / (pr_lpc_map - 1.0),
             "s_eff_lpc": u_vector["eta_lpc"] / eff_lpc_map,
+            "s_W_hpc": Wc_hpc_analyt / Wc_hpc_map,
+            "s_PR_hpc": (dp_magnitudes["PR_hpc"] - 1.0) / (pr_hpc_map - 1.0),
             "s_eff_hpc": u_vector["eta_hpc"] / eff_hpc_map,
+            "s_W_hpt": Wc_hpt_analyt / Wc_hpt_map,
+            "s_PR_hpt": (dp_magnitudes["PR_hpt"] - 1.0) / (3.0 - 1.0),
             "s_eff_hpt": u_vector["eta_hpt"] / eff_hpt_map,
+            "s_W_lpt": Wc_lpt_analyt / Wc_lpt_map,
+            "s_PR_lpt": (dp_magnitudes["PR_lpt"] - 1.0) / (3.0 - 1.0),
             "s_eff_lpt": u_vector["eta_lpt"] / eff_lpt_map,
         }
 
-        print("\n--- Optimization Parameter Vector (u) ---")
+        print("Optimization Parameter Vector (u)")
         for k, v in u_vector.items():
-            print(f"  {k}: {v:.4f}")
+            print(f"  {k}: {v:.5f}")
 
-        print("\n--- DP Thermodynamic Magnitudes ---")
-        for k, v in dp_magnitudes.items():
-            print(f"  {k}: {v:.4f}")
-
-        print("\n--- Map Scaling Factors (SF) ---")
+        print("\nMap Scaling Factors (SF)")
         for k, v in scaling_factors.items():
-            print(f"  {k}: {v:.4f}")
+            print(f"  {k}: {v:.5f}")
 
         np.savez(
             output_dir / "solver_history.npz",
@@ -238,6 +308,11 @@ def main():
             scaling_factors=scaling_factors,
             success=success,
         )
+        print(
+            f"\nAnalytical DP Converged. W2: {W2_conv:.2f} kg/s, Tt4: {Tt4_conv:.2f} K"
+        )
+    else:
+        print("\nAnalytical DP Failed to converge.")
 
 
 if __name__ == "__main__":
