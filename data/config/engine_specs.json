@@ -33,5 +33,31 @@
         "Cd_18_initial": 0.98,
         "k_noz": 0.045
     },
-    "fan_radial_scalar_sigma": 0.72
+    "fan_radial_scalar_sigma": 0.72,
+    "map_calibration_bounds": {
+        "fan_w_c": [
+            0.85,
+            1.15
+        ],
+        "fan_eff": [
+            0.90,
+            1.10
+        ],
+        "hpc_w_c": [
+            0.85,
+            1.15
+        ],
+        "hpc_eff": [
+            0.90,
+            1.10
+        ],
+        "hpt_w_c": [
+            0.85,
+            1.15
+        ],
+        "hpt_eff": [
+            0.90,
+            1.10
+        ]
+    }
 }

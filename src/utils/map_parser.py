@@ -1,8 +1,10 @@
 """
 Turbomachinery map parser and interpolator.
-Handles T-MATS ASCII ingestion, Imperial to SI conversion, scaling, and C2-continuous splines.
+Handles T-MATS ASCII ingestion, legacy Fortran fixed-width token separation,
+Imperial to SI conversion, scaling, and C2-continuous splines.
 """
 
+import re
 from typing import Optional, Tuple
 import numpy as np
 from scipy.interpolate import RectBivariateSpline
@@ -90,7 +92,8 @@ def parse_tmats_map(
 ) -> TurbomachineryMap:
     """
     Parses a NASA T-MATS ASCII map using a robust flattened stream protocol.
-    Applies 0.45359237 kg/lbm conversion and Design Point scaling factors.
+    Applies regex sanitization for legacy Fortran fixed-width truncations,
+    0.45359237 kg/lbm conversion, and Design Point scaling factors.
     """
     with open(filepath, "r") as f:
         lines = [
@@ -99,16 +102,29 @@ def parse_tmats_map(
             if line.strip() and not line.startswith("!")
         ]
 
-    # Extract dimensions from line 1
     dims = lines[0].split()
     n_cols, n_speeds = int(dims[0]), int(dims[1])
 
-    # Flatten all remaining tokens into a single numeric stream
     raw_data = []
-    for line in lines[1:]:
-        raw_data.extend([float(x) for x in line.split()])
+    for line_num, line in enumerate(lines[1:], start=2):
+        clean_line = line.split("!")[0].split("#")[0]
 
-    # Initialize destination matrices with strict typing
+        # 1. Separar floats pegados por el signo menos (ej: "1.5-2.0" -> "1.5 -2.0")
+        clean_line = re.sub(r"(?<![eE\s])-", " -", clean_line)
+
+        # 2. Separar floats decimales fusionados por falta de ancho (ej: "0.91370.9113" -> "0.9137 0.9113")
+        # Busca una parte decimal seguida inmediatamente por un dígito y otro punto decimal.
+        clean_line = re.sub(r"(\.\d+?)(?=\d\.)", r"\1 ", clean_line)
+
+        for token in clean_line.split():
+            try:
+                raw_data.append(float(token))
+            except ValueError:
+                raise ValueError(
+                    f"Artefacto corrupto imposible de parsear en la línea {line_num}: '{token}'. "
+                    f"Archivo: {filepath}"
+                )
+
     nc_grid = np.zeros(n_speeds)
     wc_data = np.zeros((n_speeds, n_cols))
     eff_data = np.zeros((n_speeds, n_cols))
@@ -119,29 +135,23 @@ def parse_tmats_map(
     lbm_to_kg = 0.45359237
     ptr = 0
 
-    # 1. Extract auxiliary coordinate schedule (Beta line or PR schedule)
     beta_grid = np.array(raw_data[ptr : ptr + n_cols], dtype=np.float64)
     ptr += n_cols
 
-    # 2. Extract sequential speed-line blocks
     for i in range(n_speeds):
-        # Rotational speed scalar (normalize percentage to dimensionless fraction)
         nc_grid[i] = raw_data[ptr] / 100.0
         ptr += 1
 
-        # Corrected mass flow capacity [kg/s]
         wc_data[i, :] = (
             np.array(raw_data[ptr : ptr + n_cols], dtype=np.float64) * lbm_to_kg * sf_w
         )
         ptr += n_cols
 
-        # Isentropic efficiency [-]
         eff_data[i, :] = (
             np.array(raw_data[ptr : ptr + n_cols], dtype=np.float64) * sf_eff
         )
         ptr += n_cols
 
-        # Total pressure ratio [-] (Compressors only)
         if is_compressor and pr_data is not None:
             raw_pr = np.array(raw_data[ptr : ptr + n_cols], dtype=np.float64)
             pr_data[i, :] = 1.0 + (raw_pr - 1.0) * sf_pr
