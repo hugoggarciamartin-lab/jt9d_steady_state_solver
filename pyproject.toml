@@ -31,3 +31,6 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*", "scripts*", "tests*"]
+
+[project.scripts]
+jt9d-run = "run_pipeline:main"
