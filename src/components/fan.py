@@ -1,133 +1,105 @@
 """
-Unified Fan component module for 0D steady-state engine simulation.
-Processes inlet conditions and map coordinates to output separated core and bypass streams,
-accounting for radial pressure distortion.
+Fan component module.
+Enforces strict aerodynamic similarity transformations from corrected T-MATS map
+parameters to physical station thermodynamics.
 """
 
-from typing import Dict, Tuple
+import numpy as np
 from dataclasses import dataclass
-from src.utils.map_parser import TurbomachineryMap
 from src.utils.gas_properties import GasProperties
 
 
 @dataclass
 class FanOutput:
-    W_fan: float  # Total physical mass flow [kg/s]
-    W_core: float  # Core physical mass flow (Station 21) [kg/s]
-    W_bypass: float  # Bypass physical mass flow (Station 13) [kg/s]
-    Pt13: float  # Bypass total pressure [Pa]
-    Tt13: float  # Bypass total temperature [K]
-    Pt21: float  # Core total pressure [Pa]
-    Tt21: float  # Core total temperature [K]
-    power_req: float  # Mechanical power required [W]
-    penalty: float  # Boundary violation penalty for the optimizer
+    W_in: float
+    W_fan: float
+    Pt13: float
+    Tt13: float
+    Pt21: float
+    Tt21: float
+    power_req: float
+    SM: float
+    penalty: float
 
 
 class Fan:
-    """
-    Aerothermodynamic Fan component.
-    Models a unified fan stage splitting flow based on Bypass Ratio, applying
-    a radial scalar to differentiate root (core) and tip (bypass) pressure ratios.
-    """
-
-    T_REF = 288.15
-    P_REF = 101325.0
-
-    def __init__(self, fan_map: TurbomachineryMap, gas_props: GasProperties):
-        self.fan_map = fan_map
+    def __init__(self, fan_map, gas_props: GasProperties):
+        self.map = fan_map
         self.gas = gas_props
-
-    def _solve_temperature_from_enthalpy(
-        self, h_target: float, T_guess: float
-    ) -> float:
-        """Local Newton-Raphson solver to reverse-lookup temperature from sensible enthalpy."""
-        T_iter = T_guess
-        for _ in range(10):
-            h_current = self.gas.calculate_enthalpy(T_iter, f=0.0)
-            residual = h_current - h_target
-
-            if abs(residual) < 1e-3:
-                return T_iter
-
-            cp_current = self.gas.calculate_cp(T_iter, f=0.0)
-            T_iter -= residual / cp_current
-
-        return T_iter
 
     def calculate(
         self,
-        Pt2: float,
-        Tt2: float,
-        N1: float,
-        N1_design: float,
+        Pt_in: float,
+        Tt_in: float,
+        N_mech: float,
+        N_des: float,
         beta: float,
         BPR: float,
         sigma: float = 1.0,
     ) -> FanOutput:
-        """
-        Executes the forward aerothermodynamic pass.
 
-        Args:
-            Pt2: Inlet total pressure [Pa]
-            Tt2: Inlet total temperature [K]
-            N1: Physical LP shaft speed [rpm]
-            N1_design: Reference LP shaft speed for scaling [rpm]
-            beta: Map operating line auxiliary coordinate [-]
-            BPR: Bypass Ratio (W_bypass / W_core) [-]
-            sigma: Radial pressure scalar (attenuates pressure rise at the root) [-]
-        """
-        theta_t2 = Tt2 / self.T_REF
-        delta_t2 = Pt2 / self.P_REF
-        Nc_fan = (N1 / N1_design) / (theta_t2**0.5)
+        # Similarity Parameters (Theta and Delta referenced to ISA SLS)
+        theta = Tt_in / 288.15
+        delta = Pt_in / 101325.0
 
-        Wc, eff, pr_map, penalty = self.fan_map.evaluate(Nc_fan, beta)
+        # Corrected speed fraction
+        Nc_actual = N_mech / np.sqrt(theta)
+        Nc_design = N_des / np.sqrt(1.0)
+        speed_param = Nc_actual / Nc_design
 
-        W_fan = Wc * (delta_t2) / (theta_t2**0.5)
-        W_core = W_fan / (1.0 + BPR)
-        W_bypass = W_fan * (BPR / (1.0 + BPR))
+        penalty = 0.0
 
-        # Radial distortion: apply sigma only to the pressure rise to prevent unphysical vacuums
-        pr_byp = pr_map
-        pr_core = 1.0 + (pr_map - 1.0) * sigma
+        # Map Evaluation
+        try:
+            Wc_map, eff_map, PR_map, SM = self.map.evaluate(speed_param, beta)
+        except ValueError:
+            Wc_map, eff_map, PR_map, SM = 100.0, 0.50, 1.0, 0.0
+            penalty += 1e6
 
-        gamma_in = self.gas.calculate_gamma(Tt2, f=0.0)
-        h_in = self.gas.calculate_enthalpy(Tt2, f=0.0)
+        if PR_map < 1.0:
+            PR_map = 1.001
+            penalty += 1e5
+        if eff_map < 0.1:
+            eff_map = 0.1
+            penalty += 1e5
 
-        # --- Bypass Stream (Tip) Thermodynamics ---
-        Pt13 = Pt2 * pr_byp
-        Tt13_is = Tt2 * (pr_byp ** ((gamma_in - 1.0) / gamma_in))
-        h13_is = self.gas.calculate_enthalpy(Tt13_is, f=0.0)
+        # Transform to Physical Mass Flow
+        # W_phys = W_corr * (delta / sqrt(theta))
+        W_phys = Wc_map * delta / np.sqrt(theta)
 
-        delta_h_byp_ideal = h13_is - h_in
-        delta_h_byp_real = delta_h_byp_ideal / eff
-        h13_real = h_in + delta_h_byp_real
+        # Thermodynamic State Updates
+        Pt_out_byp = Pt_in * PR_map
+        Pt_out_core = (
+            Pt_in * PR_map * sigma
+        )  # Applies root-tip pressure profile distortion
 
-        T_guess_13 = Tt2 + (Tt13_is - Tt2) / eff
-        Tt13 = self._solve_temperature_from_enthalpy(h13_real, T_guess_13)
+        h_in = self.gas.calculate_enthalpy(Tt_in, 0.0)
 
-        # --- Core Stream (Root) Thermodynamics ---
-        Pt21 = Pt2 * pr_core
-        Tt21_is = Tt2 * (pr_core ** ((gamma_in - 1.0) / gamma_in))
-        h21_is = self.gas.calculate_enthalpy(Tt21_is, f=0.0)
+        # Isentropic compression
+        cp = self.gas.calculate_cp(Tt_in, 0.0)
+        gamma = cp / (cp - 287.05)
+        Tt_out_ideal = Tt_in * (PR_map ** ((gamma - 1.0) / gamma))
+        h_out_ideal = self.gas.calculate_enthalpy(Tt_out_ideal, 0.0)
 
-        delta_h_core_ideal = h21_is - h_in
-        delta_h_core_real = delta_h_core_ideal / eff
-        h21_real = h_in + delta_h_core_real
+        # Actual enthalpy and temperature out
+        dh_actual = (h_out_ideal - h_in) / eff_map
+        h_out_actual = h_in + dh_actual
 
-        T_guess_21 = Tt2 + (Tt21_is - Tt2) / eff
-        Tt21 = self._solve_temperature_from_enthalpy(h21_real, T_guess_21)
+        # Using specific heat approximation for inverse temperature if inverse enthalpy method is missing
+        cp_out = self.gas.calculate_cp(Tt_out_ideal, 0.0)
+        Tt_out_actual = Tt_in + (dh_actual / cp_out)
 
-        # Mechanical Power Requirement is mass-weighted by stream
-        power_req = (W_bypass * delta_h_byp_real) + (W_core * delta_h_core_real)
+        # Aerodynamic Power Extraction
+        power_req = W_phys * dh_actual
 
         return FanOutput(
-            W_fan=W_fan,
-            W_core=W_core,
-            W_bypass=W_bypass,
-            Pt13=Pt13,
-            Tt13=Tt13,
-            Pt21=Pt21,
-            Tt21=Tt21,
+            W_in=W_phys,
+            W_fan=W_phys,
+            Pt13=Pt_out_byp,
+            Tt13=Tt_out_actual,
+            Pt21=Pt_out_core,
+            Tt21=Tt_out_actual,
             power_req=power_req,
+            SM=SM,
             penalty=penalty,
         )

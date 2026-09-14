@@ -1,9 +1,9 @@
 """
 Combustor component module for 0D steady-state engine simulation.
-Solves the vitiated enthalpy balance and enforces flammability limits,
-incorporating analytical cold/hot pressure loss factors (PLF).
+Evaluates exact enthalpy balance for fuel addition and Rayleigh pressure losses.
 """
 
+import numpy as np
 from dataclasses import dataclass
 from src.utils.gas_properties import GasProperties
 
@@ -18,68 +18,51 @@ class CombustorOutput:
 
 
 class Combustor:
-    def __init__(
-        self,
-        gas_props: GasProperties,
-        LHV: float = 43.125e6,  # Jet-A1 standard [J/kg]
-        k1: float = 2.0e-4,
-        k2: float = 0.8e-4,
-        eta_cc: float = 0.995,
-    ):
+    def __init__(self, gas_props: GasProperties, k1: float, k2: float):
         self.gas = gas_props
-        self.LHV = LHV
-        self.k1 = k1
-        self.k2 = k2
-        self.eta_cc = eta_cc
-        self.f_LDO = 0.0080
-        self.f_RBO = 0.0580
-
-    def _solve_temperature_from_enthalpy(
-        self, h_target: float, T_guess: float, f: float
-    ) -> float:
-        T_iter = T_guess
-        for _ in range(15):
-            h_current = self.gas.calculate_enthalpy(T_iter, f)
-            residual = h_current - h_target
-            if abs(residual) < 1e-3:
-                return T_iter
-            cp_current = self.gas.calculate_cp(T_iter, f)
-            T_iter -= residual / cp_current
-        return T_iter
+        self.k1 = k1  # Cold loss coefficient (friction)
+        self.k2 = k2  # Hot loss coefficient (heat addition)
+        self.f_LDO = 0.005  # Lean Die-Out default (overridden by JSON)
+        self.f_RBO = 0.060  # Rich Blow-Out default (overridden by JSON)
+        self.eta_comb = 0.995  # Combustor efficiency
+        self.LHV = 43.1e6  # Lower Heating Value [J/kg]
 
     def calculate(
         self, Pt_in: float, Tt_in: float, W_in: float, W_f: float
     ) -> CombustorOutput:
         penalty = 0.0
-        k_penalty = 1e6
 
-        f = W_f / W_in
-        if f < self.f_LDO:
-            penalty += k_penalty * (self.f_LDO - f) ** 2
-            f = self.f_LDO
-        elif f > self.f_RBO:
-            penalty += k_penalty * (f - self.f_RBO) ** 2
-            f = self.f_RBO
-
+        # 1. Mass continuity and Fuel-to-Air Ratio
+        W_in = max(W_in, 1e-4)
         W_out = W_in + W_f
-        h_in = self.gas.calculate_enthalpy(Tt_in, f=0.0)
-        Q_in = (W_in * h_in) + (W_f * self.LHV * self.eta_cc)
-        h_out_target = Q_in / W_out
+        f = W_f / W_in
 
-        cp_approx = 1150.0
-        T_guess = Tt_in + (W_f * self.LHV * self.eta_cc) / (W_out * cp_approx)
-        Tt_out = self._solve_temperature_from_enthalpy(h_out_target, T_guess, f)
+        # Flammability limit penalties (soft continuous barrier for DO-178C Jacobian stability)
+        if f < self.f_LDO:
+            penalty += 1e5 * (self.f_LDO - f) ** 2
+        elif f > self.f_RBO:
+            penalty += 1e5 * (f - self.f_RBO) ** 2
 
-        # Analytical Pressure Loss Factor (PLF) evaluating cold and hot momentum losses
-        flow_parameter = (W_in * (Tt_in**0.5)) / Pt_in
+        # 2. Strict Enthalpy Balance
+        h_in = self.gas.calculate_enthalpy(Tt_in, 0.0)
+        heat_added = (W_f * self.LHV * self.eta_comb) / W_out
+        h_out_target = (W_in * h_in) / W_out + heat_added
+
+        # Fast Newton-Raphson internal root finding for Tt_out
+        Tt_out = Tt_in + heat_added / 1150.0
+        for _ in range(5):
+            cp = self.gas.calculate_cp(Tt_out, f)
+            Tt_out -= (self.gas.calculate_enthalpy(Tt_out, f) - h_out_target) / cp
+
+        # 3. Rayleigh Pressure Loss (Momentum + Heat Addition physics)
+        flow_parameter = (W_in * np.sqrt(Tt_in)) / Pt_in
         dp_loss = self.k1 * (flow_parameter**2) + self.k2 * (flow_parameter**2) * (
             (Tt_out / Tt_in) - 1.0
         )
+
+        # Absolute clipping to prevent inverted physics during numerical transients
+        dp_loss = np.clip(dp_loss, 0.0, 0.20)
+
         Pt_out = Pt_in * (1.0 - dp_loss)
 
-        if Tt_out > 2000.0:
-            penalty += k_penalty * (Tt_out - 2000.0) ** 2
-
-        return CombustorOutput(
-            W_out=W_out, f=f, Pt_out=Pt_out, Tt_out=Tt_out, penalty=penalty
-        )
+        return CombustorOutput(W_out, f, Pt_out, Tt_out, penalty)

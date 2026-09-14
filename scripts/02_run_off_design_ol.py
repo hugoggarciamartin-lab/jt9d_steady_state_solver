@@ -1,8 +1,7 @@
 """
-Off-Design Operating Line Solver.
-Executes the steady-state transient sweep strictly along the validation points
-provided in off_design_validation.json, enforcing DO-178C data coupling.
-Initial guess vector incorporates numerical pull-back and homotopy anchoring.
+Off Design Operating Line Solver.
+Executes the steady state transient sweep strictly along the validation points.
+Implements a dense homotopy ramp and strict fractional step relaxation.
 """
 
 import sys
@@ -52,7 +51,6 @@ class OffDesignEvaluator:
 
         self.N1_des = engine_specs["mechanical"]["design_speeds"]["N1_rpm"]
         self.N2_des = engine_specs["mechanical"]["design_speeds"]["N2_rpm"]
-
         self.A8_m2 = engine_specs["geometry"]["A8_m2"]
         self.A18_m2 = engine_specs["geometry"]["A18_m2"]
         self.W_f_target = W_f_target
@@ -66,11 +64,14 @@ class OffDesignEvaluator:
         self.Wc_hpc = 0.0
 
     def evaluate(self, state_vector: np.ndarray) -> np.ndarray:
-        beta_fan, beta_lpc, beta_hpc, pr_hpt, pr_lpt, BPR, N1, N2 = state_vector
-
-        N1 = max(N1, 500.0)
-        N2 = max(N2, 1000.0)
-        BPR = max(BPR, 0.1)
+        beta_fan = np.clip(state_vector[0], 0.01, 0.99)
+        beta_lpc = np.clip(state_vector[1], 0.01, 0.99)
+        beta_hpc = np.clip(state_vector[2], 0.01, 0.99)
+        pr_hpt = max(state_vector[3], 1.05)
+        pr_lpt = max(state_vector[4], 1.05)
+        BPR = max(state_vector[5], 0.1)
+        N1 = max(state_vector[6], 500.0)
+        N2 = max(state_vector[7], 1000.0)
 
         Pt2 = self.ambient_cond["Pt"]
         Tt2 = self.ambient_cond["Tt"]
@@ -86,10 +87,16 @@ class OffDesignEvaluator:
             sigma=self.engine_specs["fan_radial_scalar_sigma"],
         )
 
+        W_core_actual = (
+            fan_out.W_in / (1.0 + BPR)
+            if hasattr(fan_out, "W_in")
+            else fan_out.W_fan / (1.0 + BPR)
+        )
+        W_byp_actual = W_core_actual * BPR
+
         lpc_out = self.components["lpc"].calculate(
             fan_out.Pt21, fan_out.Tt21, N1, self.N1_des, beta_lpc, bleed_fraction=0.0
         )
-
         hpc_out = self.components["hpc"].calculate(
             lpc_out.Pt_out,
             lpc_out.Tt_out,
@@ -98,11 +105,9 @@ class OffDesignEvaluator:
             beta_hpc,
             bleed_fraction=self.u_vector["xi_cool"],
         )
-
         comb_out = self.components["comb"].calculate(
             hpc_out.Pt_out, hpc_out.Tt_out, hpc_out.W_out, self.W_f_target
         )
-
         hpt_out = self.components["hpt"].calculate(
             comb_out.Pt_out,
             comb_out.Tt_out,
@@ -114,7 +119,6 @@ class OffDesignEvaluator:
             W_cool=hpc_out.W_bleed,
             Tt_cool=hpc_out.Tt_out,
         )
-
         lpt_out = self.components["lpt"].calculate(
             hpt_out.Pt_out,
             hpt_out.Tt_out,
@@ -134,18 +138,15 @@ class OffDesignEvaluator:
             lpt_out.f_out,
             P_amb,
             A_throat=self.A8_m2,
-            Cd_DP=self.u_vector["Cd_8"],
             k_noz=self.u_vector["k_noz"],
         )
-
         byp_noz_out = self.components["byp_noz"].calculate(
             fan_out.Pt13,
             fan_out.Tt13,
-            fan_out.W_bypass,
+            W_byp_actual,
             0.0,
             P_amb,
             A_throat=self.A18_m2,
-            Cd_DP=self.u_vector["Cd_18"],
             k_noz=self.u_vector["k_noz"],
         )
 
@@ -156,22 +157,18 @@ class OffDesignEvaluator:
             lpt_out.power_gen, fan_out.power_req + lpc_out.power_req
         )
 
-        res_w_lpc = (lpc_out.W_in - fan_out.W_core) / max(fan_out.W_core, 1e-6)
+        res_w_lpc = (lpc_out.W_in - W_core_actual) / max(W_core_actual, 1e-6)
         res_w_hpc = (hpc_out.W_in - lpc_out.W_out) / max(lpc_out.W_out, 1e-6)
         res_w_hpt = (hpt_out.W_capacity - comb_out.W_out) / max(comb_out.W_out, 1e-6)
         res_w_lpt = (lpt_out.W_capacity - hpt_out.W_out) / max(hpt_out.W_out, 1e-6)
         res_w_core = (core_noz_out.W_calc - lpt_out.W_out) / max(lpt_out.W_out, 1e-6)
-        res_w_byp = (byp_noz_out.W_calc - fan_out.W_bypass) / max(
-            fan_out.W_bypass, 1e-6
-        )
-
+        res_w_byp = (byp_noz_out.W_calc - W_byp_actual) / max(W_byp_actual, 1e-6)
         res_hp_mech = hp_balance.power_net / 1e6
         res_lp_mech = lp_balance.power_net / 1e6
 
         self.Fn = core_noz_out.Fg + byp_noz_out.Fg
         self.SFC = (self.W_f_target * 3600.0) / max(self.Fn, 1.0)
         self.EGT = lpt_out.Tt_out
-
         self.PR_fan = fan_out.Pt13 / Pt2
         self.Wc_fan = fan_out.W_fan * np.sqrt(Tt2 / 288.15) / (Pt2 / 101325.0)
         self.PR_hpc = hpc_out.Pt_out / lpc_out.Pt_out
@@ -201,7 +198,6 @@ class OffDesignEvaluator:
                 res_lp_mech,
             ]
         )
-
         return residuals * (1.0 + penalty)
 
 
@@ -214,6 +210,7 @@ def main():
     engine_specs = load_data(config_dir / "engine_specs.json")
     validation_data = load_data(telemetry_dir / "off_design_validation.json")
     dp_data = load_data(log_dir / "solver_history.npz")
+
     sf = dp_data["scaling_factors"].item()
     u_vec = dp_data["u_vector"].item()
     dp_mags = dp_data["dp_magnitudes"].item()
@@ -276,22 +273,13 @@ def main():
     }
 
     ambient_cond = {"Pt": 101325.0, "Tt": 288.15, "P_amb": 101325.0}
-    nr_solver = NewtonRaphsonSolver(max_iters=40, tolerance=1e-4)
 
-    bpr_design = engine_specs["geometry"].get("BPR_design", 5.0)
-
-    current_guess = np.array(
-        [
-            0.70,  # beta_fan
-            0.70,  # beta_lpc
-            0.70,  # beta_hpc
-            dp_mags["PR_hpt"] * 0.98,
-            dp_mags["PR_lpt"] * 0.98,
-            bpr_design,
-            engine_specs["mechanical"]["design_speeds"]["N1_rpm"],
-            engine_specs["mechanical"]["design_speeds"]["N2_rpm"],
-        ]
+    nr_solver = NewtonRaphsonSolver(
+        max_iters=50, tolerance=1e-4, fd_eps=1e-3, max_step_frac=0.05
     )
+
+    # Load exact pre-solved 8-variable state vector directly from calibration history
+    current_guess = dp_data["state_vector"]
 
     results = {
         "Rating": [],
@@ -311,10 +299,18 @@ def main():
 
     print("Initiating MoC 2 Validation Sweep...\n")
 
-    homotopy_points = [
-        {"rating": "DP Anchor (100%)", "W_f_target_kg_s": dp_mags["W_f_physical"]}
-    ]
-    validation_points = homotopy_points + validation_data["validation_points"]
+    W_f_DP = dp_mags["W_f_physical"]
+    first_target = validation_data["validation_points"][0]["W_f_target_kg_s"]
+
+    ramp_steps = np.linspace(W_f_DP, first_target, 5)
+
+    homotopy_points = [{"rating": "DP Anchor (100%)", "W_f_target_kg_s": W_f_DP}]
+    for i, wf in enumerate(ramp_steps[1:]):
+        homotopy_points.append(
+            {"rating": f"Transition Step {i + 1}", "W_f_target_kg_s": wf}
+        )
+
+    validation_points = homotopy_points + validation_data["validation_points"][1:]
 
     for point in validation_points:
         w_f = point["W_f_target_kg_s"]

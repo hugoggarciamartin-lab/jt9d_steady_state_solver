@@ -1,135 +1,102 @@
 """
-Turbine component module for 0D steady-state engine simulation.
-Evaluates HPT/LPT expansion, work extraction, and cooling bleed mixing.
+Turbine component module.
+Computes map-based flow capacity, generates mechanical power, and enforces
+enthalpy-weighted cooling bleed mixing at the exit station.
 """
 
+import numpy as np
 from dataclasses import dataclass
-from src.utils.map_parser import TurbomachineryMap
 from src.utils.gas_properties import GasProperties
 
 
 @dataclass
 class TurbineOutput:
-    W_capacity: (
-        float  # Map-demanded physical mass flow (for continuity residuals) [kg/s]
-    )
-    W_out: float  # Actual physical mass flow leaving the turbine [kg/s]
-    Pt_out: float  # Discharge total pressure [Pa]
-    Tt_out: float  # Discharge total temperature [K]
-    power_gen: float  # Mechanical power generated [W]
-    f_out: float  # Diluted fuel-to-air ratio after cooling mixing [-]
-    penalty: float  # Boundary violation penalty
+    W_in: float
+    W_out: float
+    W_capacity: float
+    f_out: float
+    Pt_out: float
+    Tt_out: float
+    power_gen: float
+    penalty: float
 
 
 class Turbine:
-    """
-    Aerothermodynamic Turbine component (HPT/LPT).
-    Models expansion, efficiency limits, and unvitiated cooling bleed reinjection.
-    """
-
-    T_REF = 288.15
-    P_REF = 101325.0
-
-    def __init__(self, turb_map: TurbomachineryMap, gas_props: GasProperties):
-        self.turb_map = turb_map
+    def __init__(self, turb_map, gas_props: GasProperties):
+        self.map = turb_map
         self.gas = gas_props
-
-    def _solve_temperature_from_enthalpy(
-        self, h_target: float, T_guess: float, f: float
-    ) -> float:
-        """Local Newton-Raphson to reverse-lookup temperature from sensible enthalpy."""
-        T_iter = T_guess
-        for _ in range(10):
-            h_current = self.gas.calculate_enthalpy(T_iter, f)
-            residual = h_current - h_target
-
-            if abs(residual) < 1e-3:
-                return T_iter
-
-            cp_current = self.gas.calculate_cp(T_iter, f)
-            T_iter -= residual / cp_current
-
-        return T_iter
 
     def calculate(
         self,
         Pt_in: float,
         Tt_in: float,
-        W_in: float,
+        W_in_actual: float,
         f_in: float,
         N_mech: float,
-        N_design: float,
-        PR: float,
+        N_des: float,
+        PR_req: float,
         W_cool: float = 0.0,
         Tt_cool: float = 288.15,
     ) -> TurbineOutput:
-        """
-        Executes the forward aerothermodynamic pass for the turbine.
 
-        Args:
-            Pt_in: Inlet total pressure [Pa]
-            Tt_in: Inlet total temperature [K]
-            W_in: Inlet physical mass flow (from combustor or upstream turbine) [kg/s]
-            f_in: Inlet fuel-to-air ratio [-]
-            N_mech: Physical shaft speed [rpm]
-            N_design: Reference shaft speed [rpm]
-            PR: Expansion pressure ratio (Pt_in / Pt_out) [-]
-            W_cool: Cooling bleed mass flow mixed before expansion [kg/s]
-            Tt_cool: Total temperature of the cooling bleed [K]
-        """
-        # 1. Cooling Bleed Mixing (Bulk approximation at inlet)
-        W_mixed = W_in + W_cool
-        f_mixed = (W_in * f_in) / W_mixed  # Dilution of vitiated gas
+        theta = Tt_in / 288.15
+        delta = Pt_in / 101325.0
 
-        h_in_main = self.gas.calculate_enthalpy(Tt_in, f_in)
-        h_cool = self.gas.calculate_enthalpy(Tt_cool, f=0.0)
+        Nc_actual = N_mech / np.sqrt(theta)
+        Nc_design = N_des / np.sqrt(1.0)
+        speed_param = Nc_actual / Nc_design
 
-        h_mixed = ((W_in * h_in_main) + (W_cool * h_cool)) / W_mixed
+        penalty = 0.0
 
-        # Estimate mixed temperature
-        Tt_mixed = self._solve_temperature_from_enthalpy(h_mixed, Tt_in, f_mixed)
-        Pt_mixed = Pt_in  # Assume isobaric mixing for 0D scope
+        try:
+            # Map returns corrected flow capacity and efficiency given speed and PR
+            Wc_map, eff_map, _ = self.map.evaluate(speed_param, PR_req)
+        except ValueError:
+            Wc_map, eff_map = 20.0, 0.85
+            penalty += 1e6
 
-        # 2. Corrected Speed Calculation
-        theta = Tt_mixed / self.T_REF
-        delta = Pt_mixed / self.P_REF
-        Nc = (N_mech / N_design) / (theta**0.5)
+        if PR_req < 1.001:
+            PR_req = 1.001
+            penalty += 1e5
+        if eff_map < 0.1:
+            eff_map = 0.1
+            penalty += 1e5
 
-        # 3. Map Interpolation
-        Wc, eff, penalty = self.turb_map.evaluate(Nc, PR)
+        # De-correct to find aerodynamic flow capacity
+        W_capacity = Wc_map * delta / np.sqrt(theta)
 
-        # 4. Physical Flow Capacity (Deprojection)
-        # This dictates how much mass the turbine CAN swallow at this PR and Nc
-        W_capacity = Wc * delta / (theta**0.5)
+        Pt_out = Pt_in / PR_req
 
-        # 5. Isentropic Expansion
-        Pt_out = Pt_mixed / PR
-        gamma_mix = self.gas.calculate_gamma(Tt_mixed, f_mixed)
+        h_in = self.gas.calculate_enthalpy(Tt_in, f_in)
 
-        # Ideal exit temperature
-        Tt_out_is = Tt_mixed * ((1.0 / PR) ** ((gamma_mix - 1.0) / gamma_mix))
+        cp_in = self.gas.calculate_cp(Tt_in, f_in)
+        gamma = cp_in / (cp_in - 287.05)
+        Tt_out_ideal = Tt_in * ((1.0 / PR_req) ** ((gamma - 1.0) / gamma))
+        h_out_ideal = self.gas.calculate_enthalpy(Tt_out_ideal, f_in)
 
-        # 6. Enthalpy Balance
-        h_out_is = self.gas.calculate_enthalpy(Tt_out_is, f_mixed)
+        dh_actual = (h_in - h_out_ideal) * eff_map
+        h_out_main = h_in - dh_actual
 
-        delta_h_ideal = h_mixed - h_out_is
-        delta_h_real = delta_h_ideal * eff
-        h_out_real = h_mixed - delta_h_real
+        # Power generation strictly from the actual mainstream flow
+        power_gen = W_in_actual * dh_actual
 
-        # Real exit temperature inversion
-        T_guess = Tt_mixed - (Tt_mixed - Tt_out_is) * eff
-        Tt_out = self._solve_temperature_from_enthalpy(h_out_real, T_guess, f_mixed)
+        # Mix high-pressure cooling bleed at turbine exit
+        h_cool = self.gas.calculate_enthalpy(Tt_cool, 0.0)
+        W_out = W_in_actual + W_cool
+        f_out = (W_in_actual * f_in) / max(W_out, 1e-6)
 
-        # 7. Mechanical Power Generation
-        # Power is generated by the physical mass actually flowing through (W_mixed)
-        power_gen = W_mixed * delta_h_real
+        h_out_mix = ((W_in_actual * h_out_main) + (W_cool * h_cool)) / max(W_out, 1e-6)
+
+        cp_out = self.gas.calculate_cp(Tt_out_ideal, f_out)
+        Tt_out_actual = Tt_in - ((h_in - h_out_mix) / cp_out)
 
         return TurbineOutput(
+            W_in=W_in_actual,
+            W_out=W_out,
             W_capacity=W_capacity,
-            W_out=W_mixed,
+            f_out=f_out,
             Pt_out=Pt_out,
-            Tt_out=Tt_out,
+            Tt_out=Tt_out_actual,
             power_gen=power_gen,
-            f_out=f_mixed,
             penalty=penalty,
         )
